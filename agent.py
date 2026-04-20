@@ -1,12 +1,13 @@
 """
 Enterprise Customer Support Agent — Core Agent
-Supports: Groq, Gemini, OpenAI
+Uses direct LLM tool calling without AgentExecutor for maximum compatibility.
 """
+import json
 import logging
 from typing import Optional
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
 
 from config import LLM_PROVIDER, LLM_MODEL, OPENAI_API_KEY, GROQ_API_KEY, GEMINI_API_KEY
 from memory import get_memory, update_memory, append_conversation, get_conversation_history
@@ -17,33 +18,22 @@ from tools.escalate import escalate_to_human
 logger = logging.getLogger(__name__)
 
 TOOLS = [search_knowledge_base, create_support_ticket, escalate_to_human]
+TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
-SYSTEM_PROMPT = """You are a warm, professional enterprise customer support agent for a company.
+SYSTEM_PROMPT = """You are a warm, professional customer support agent.
 
-TOOLS:
-- search_knowledge_base: Search FAQs. ALWAYS use this first for any customer question.
-- create_support_ticket: Create a ticket when KB has no answer or issue needs tracking.
-- escalate_to_human: Use when customer is angry, asks for human, or issue is billing/legal/security.
+You have access to these tools:
+- search_knowledge_base: Search FAQs. Use this FIRST for every customer question.
+- create_support_ticket: Create a ticket when KB has no answer.
+- escalate_to_human: Use when customer is angry or asks for a human agent.
 
-BEHAVIOR:
-1. For EVERY customer question, search the knowledge base first
-2. Give the answer from KB directly and naturally — don't just copy-paste, explain it conversationally
-3. If KB has no answer, create a support ticket and give the ticket ID
-4. If customer is angry or says "human agent" — escalate immediately
-5. Always respond in the same language the customer writes in
-6. Be warm, empathetic, and concise
-7. When a ticket is created, always mention the ticket ID clearly
-
-IMPORTANT: You must always use at least one tool per response. Never respond without searching the KB first."""
-
-
-def _build_prompt():
-    return ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
+Rules:
+1. Always search the knowledge base first
+2. Give answers conversationally and warmly
+3. If KB has no answer, create a support ticket
+4. If customer is angry or wants human — escalate
+5. Always respond in the customer's language
+6. Mention ticket ID clearly when created"""
 
 
 def _build_llm():
@@ -60,7 +50,6 @@ def _build_llm():
             model=LLM_MODEL or "gemini-1.5-flash",
             google_api_key=GEMINI_API_KEY,
             temperature=0.2,
-            convert_system_message_to_human=True,
         )
     else:
         from langchain_openai import ChatOpenAI
@@ -71,40 +60,36 @@ def _build_llm():
         )
 
 
-def _build_agent():
-    from langchain.agents import AgentExecutor, create_tool_calling_agent
-    llm = _build_llm()
-    logger.info(f"Agent ready — provider={LLM_PROVIDER} model={LLM_MODEL}")
-    prompt = _build_prompt()
-    agent = create_tool_calling_agent(llm, TOOLS, prompt)
-    return AgentExecutor(
-        agent=agent,
-        tools=TOOLS,
-        verbose=True,
-        max_iterations=6,
-        handle_parsing_errors=True,
-        return_intermediate_steps=False,
-    )
+_llm = None
 
 
-_agent_executor = None
-
-
-def get_agent_executor():
-    global _agent_executor
-    if _agent_executor is None:
-        _agent_executor = _build_agent()
-    return _agent_executor
+def get_llm():
+    global _llm
+    if _llm is None:
+        _llm = _build_llm().bind_tools(TOOLS)
+        logger.info(f"LLM ready — provider={LLM_PROVIDER} model={LLM_MODEL}")
+    return _llm
 
 
 def _to_lc_history(history: list) -> list:
     msgs = []
-    for msg in history[-16:]:
+    for msg in history[-10:]:
         if msg["role"] == "human":
             msgs.append(HumanMessage(content=msg["content"]))
         elif msg["role"] == "assistant":
             msgs.append(AIMessage(content=msg["content"]))
     return msgs
+
+
+def _run_tool(tool_name: str, tool_args: dict) -> str:
+    tool: BaseTool = TOOLS_BY_NAME.get(tool_name)
+    if not tool:
+        return f"Tool {tool_name} not found."
+    try:
+        return tool.invoke(tool_args)
+    except Exception as e:
+        logger.error(f"Tool {tool_name} error: {e}", exc_info=True)
+        return f"Tool execution completed with note: {str(e)[:100]}"
 
 
 def run_agent(
@@ -114,6 +99,7 @@ def run_agent(
     customer_email: Optional[str] = None,
     customer_name: Optional[str] = None,
 ) -> str:
+    # Load memory
     mem = get_memory(customer_id)
     if customer_email and not mem.get("email"):
         update_memory(customer_id, {"email": customer_email})
@@ -125,28 +111,53 @@ def run_agent(
     context = (
         f"[Customer ID: {customer_id} | "
         f"Name: {mem.get('name') or customer_name or 'Guest'} | "
-        f"Channel: {channel} | "
-        f"Sentiment: {mem.get('sentiment', 'neutral')}]\n\n"
+        f"Channel: {channel}]\n\n"
     )
 
+    # Build messages
+    messages = [SystemMessage(content=SYSTEM_PROMPT)]
+    messages += _to_lc_history(history)
+    messages.append(HumanMessage(content=context + user_message))
+
     try:
-        executor = get_agent_executor()
-        result = executor.invoke({
-            "input": context + user_message,
-            "chat_history": _to_lc_history(history),
-        })
-        response = result.get("output", "")
-        if not response:
-            response = "I'm here to help! Could you please describe your issue in more detail?"
+        llm = get_llm()
+
+        # First LLM call
+        response = llm.invoke(messages)
+        messages.append(response)
+
+        # Execute tool calls if any (up to 5 rounds)
+        for _ in range(5):
+            if not response.tool_calls:
+                break
+
+            # Run all tool calls
+            for tc in response.tool_calls:
+                tool_result = _run_tool(tc["name"], tc["args"])
+                messages.append(ToolMessage(
+                    content=str(tool_result),
+                    tool_call_id=tc["id"],
+                ))
+
+            # Get next LLM response
+            response = llm.invoke(messages)
+            messages.append(response)
+
+        final = response.content
+        if not final or not final.strip():
+            final = "I'm here to help! Could you please provide more details about your issue?"
+
     except Exception as e:
         logger.error(f"Agent error [{customer_id}]: {e}", exc_info=True)
-        response = "I apologize for the inconvenience. Our team has been notified. Please try again or type 'human agent' to speak with a person directly."
+        final = "I apologize for the trouble. Please try again in a moment, or type 'human agent' to speak with a person."
 
+    # Save conversation
     append_conversation(customer_id, "human", user_message)
-    append_conversation(customer_id, "assistant", response)
+    append_conversation(customer_id, "assistant", final)
 
-    negative = ["angry", "frustrated", "terrible", "worst", "useless", "lawsuit", "ridiculous", "horrible", "pathetic"]
+    # Sentiment tracking
+    negative = ["angry", "frustrated", "terrible", "worst", "useless", "lawsuit", "ridiculous", "horrible"]
     if any(w in user_message.lower() for w in negative):
         update_memory(customer_id, {"sentiment": "negative"})
 
-    return response
+    return final
