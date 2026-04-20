@@ -164,6 +164,18 @@ def health():
     return {"status": "ok", "service": "Enterprise Customer Support Agent"}
 
 
+@app.get("/debug")
+def debug():
+    """Test the agent and return exact error if any."""
+    import traceback as tb
+    try:
+        from agent import get_llm
+        llm = get_llm()
+        return {"status": "ok", "llm": str(type(llm).__name__)}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "traceback": tb.format_exc()}
+
+
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
