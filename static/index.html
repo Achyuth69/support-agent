@@ -294,6 +294,12 @@ How can I assist you today?</div>
   const CUSTOMER_ID = "web_" + Math.random().toString(36).substr(2, 8);
   let isWaiting = false;
 
+  // Keep-alive ping every 4 minutes to prevent Railway cold starts
+  setInterval(() => fetch(window.location.origin + "/health").catch(() => {}), 240000);
+
+  // Warm up the agent on page load silently
+  fetch(window.location.origin + "/health").catch(() => {});
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   function getTime() {
     return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -357,6 +363,24 @@ How can I assist you today?</div>
   }
 
   // ── Send message ──────────────────────────────────────────────────────────
+  async function callAPI(text, retries = 2) {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const res = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ customer_id: CUSTOMER_ID, message: text, channel: 'chat' })
+        });
+        const data = await res.json();
+        if (res.ok && data.response) return data.response;
+        if (i < retries) await new Promise(r => setTimeout(r, 2000));
+      } catch (e) {
+        if (i < retries) await new Promise(r => setTimeout(r, 2000));
+      }
+    }
+    return null;
+  }
+
   async function sendMessage() {
     const input = document.getElementById('msgInput');
     const text = input.value.trim();
@@ -376,21 +400,10 @@ How can I assist you today?</div>
     showTyping();
 
     try {
-      const res = await fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          customer_id: CUSTOMER_ID,
-          message: text,
-          channel: 'chat',
-        })
-      });
-
-      const data = await res.json();
+      const response = await callAPI(text);
       hideTyping();
-
-      if (res.ok) {
-        addMessage(data.response, 'bot');
+      if (response) {
+        addMessage(response, 'bot');
       } else {
         addMessage('Sorry, something went wrong. Please try again.', 'bot');
       }
